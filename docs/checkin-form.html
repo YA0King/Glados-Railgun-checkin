@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>GLaDOS Check-in</title></head>
+<body>
+<form id="f" action="https://glados.cloud/api/user/checkin" method="POST">
+<input type="hidden" name="token" id="token">
+<input type="hidden" name="nonce" id="nonce">
+<input type="hidden" name="proof" id="proof">
+</form>
+<script>
+const q = new URLSearchParams(location.search);
+document.getElementById('token').value = q.get('token') || 'glados.cloud';
+document.getElementById('nonce').value = q.get('nonce') || '';
+document.getElementById('proof').value = q.get('proof') || '';
+document.getElementById('f').submit();
+</script>
+</body></html>
