@@ -1,5 +1,7 @@
+import hashlib
 import os
 import sys
+import time
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
@@ -32,6 +34,7 @@ class APIEndpoint(Enum):
     """API端点"""
 
     CHECKIN = "/api/user/checkin"
+    CHALLENGE = "/api/user/checkin/challenge"
     STATUS = "/api/user/status"
     POINTS = "/api/user/points"
     EXCHANGE = "/api/user/exchange"
@@ -196,6 +199,7 @@ class API:
     """API 调用"""
 
     CHECKIN_URL = APIEndpoint.CHECKIN.value
+    CHALLENGE_URL = APIEndpoint.CHALLENGE.value
     STATUS_URL = APIEndpoint.STATUS.value
     POINTS_URL = APIEndpoint.POINTS.value
     EXCHANGE_URL = APIEndpoint.EXCHANGE.value
@@ -290,15 +294,45 @@ class API:
             self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
             return None
 
-    def _get_checkin_data(self) -> Dict[str, str]:
-        """获取签到数据"""
-        return {"token": self.domain}
+    def _get_checkin_data(self, cookies: str) -> Dict[str, str]:
+        """获取签到数据：先拿 challenge 再算 proof（2026 年新版接口）。
+
+        流程：GET /api/user/checkin/challenge 拿 nonce（ttl 5 分钟）→
+        等 2.7 秒 → proof = SHA-256(nonce + '.glados-observe-v1') →
+        POST /api/user/checkin 带上 token/nonce/proof。
+        拿不到 nonce 时回退到旧版只发 token。
+        """
+        data: Dict[str, str] = {"token": self.domain}
+        challenge_url = self._get_full_url(self.CHALLENGE_URL)
+        response = self._make_request(challenge_url, "GET", cookies=cookies)
+        if not response:
+            self._log("warning", LogEmoji.WARNING, "拿不到 challenge，改用旧版只发 token", force=True)
+            return data
+        try:
+            challenge = response.json()
+        except ValueError:
+            self._log("warning", LogEmoji.WARNING, "challenge 响应解析失败，改用旧版只发 token", force=True)
+            return data
+        if challenge.get("code") != 0:
+            self._log("warning", LogEmoji.WARNING, f"challenge 返回 code={challenge.get('code')}，改用旧版只发 token", force=True)
+            return data
+        nonce = challenge.get("nonce")
+        if not nonce:
+            self._log("warning", LogEmoji.WARNING, "challenge 里没有 nonce，改用旧版只发 token", force=True)
+            return data
+        if challenge.get("turnstile"):
+            self._log("warning", LogEmoji.WARNING, "challenge 带 turnstile 字段，仍尝试接口签到（POST 不含 turnstile token）", force=True)
+        proof = hashlib.sha256((nonce + ".glados-observe-v1").encode("utf-8")).hexdigest()
+        time.sleep(2.7)
+        data["nonce"] = nonce
+        data["proof"] = proof
+        return data
 
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
         """执行签到，含设备平台自适应重试"""
         url = self._get_full_url(self.CHECKIN_URL)
-        checkin_data = self._get_checkin_data()
+        checkin_data = self._get_checkin_data(cookies)
 
         # 起始 UA 优先复用已学得的设备 UA，否则用会话默认 UA
         start_ua = self._device_ua_cache.get("_last") or self.headers.get("user-agent")
@@ -715,6 +749,10 @@ def main():
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
             payload = checker.format_results()
             logger.info(f"\n{LogEmoji.END} ========== 签到总结 ==========\n{payload['title']}\n{render_payload(payload)}")
+            # 监控口径：一个都没成（既无成功也无重复）才判失败，让 workflow 变红告警。
+            # railgun 域名用 glados cookie 必然失败，不单独计入。
+            if payload.get("success", 0) == 0 and payload.get("repeat", 0) == 0:
+                exit_code = 1
 
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
